@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyi
+*.pyz
+*.pyw
+
+# Virtual environments
+.venv/
+venv/
+.env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.spec
+*.egg-info/
+.eggs/
+wheelhouse/
+
+# Logs / cache
+*.log
+.cache/
+.mypy_cache/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Rembg model cache (user-specific)
+# (Usually in user profile, but ignore if copied locally)
+.u2net/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated output
+processed_*/
+
+# Temp
+/tmp/
+*.tmp
+
+images/
