@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Callable
 
+import cv2
 from PyQt6 import QtWidgets, QtCore, QtGui
 
 # Import preprocessing functions by module import
@@ -93,8 +94,9 @@ class Worker(QtCore.QObject):
 
                 global_bbox = None
                 if self.settings.union_bbox and img_paths:
-                    self.emitter.message.emit(f"Computing union bbox ({len(img_paths)} images)...")
+                    self.emitter.message.emit(f"Computing global union bbox for ALL images ({len(img_paths)} total)...")
                     global_bbox = pp.compute_union_bbox(img_paths, args)
+                    self.emitter.message.emit(f"Global bbox: {global_bbox}")
 
                 metas = []
                 out_dir = self.settings.output_root
@@ -114,7 +116,10 @@ class Worker(QtCore.QObject):
                 self.emitter.message.emit(f"Processed {len(metas)} images")
             else:
                 # Scene mode: organize by subfolders
-                # gather images count for progress baseline
+                # Gather all image paths from ALL scenes first
+                all_img_paths = []
+                scene_img_map = {}
+
                 for s in scenes:
                     scene_dir = input_root / s
                     imgs = pp.gather_images(
@@ -125,9 +130,18 @@ class Worker(QtCore.QObject):
                     )
                     if self.settings.max_images > 0:
                         imgs = imgs[:self.settings.max_images]
+                    scene_img_map[s] = imgs
+                    all_img_paths.extend(imgs)
                     total += len(imgs)
-                processed = 0
 
+                # Compute GLOBAL bbox across ALL scenes if union_bbox is enabled
+                global_bbox = None
+                if self.settings.union_bbox and all_img_paths:
+                    self.emitter.message.emit(f"Computing global union bbox across ALL scenes ({len(all_img_paths)} total images)...")
+                    global_bbox = pp.compute_union_bbox(all_img_paths, args)
+                    self.emitter.message.emit(f"Global bbox: {global_bbox}")
+
+                processed = 0
                 for scene_name in scenes:
                     if self._cancel:
                         self.emitter.message.emit('Cancelled before scene '+scene_name)
@@ -136,29 +150,22 @@ class Worker(QtCore.QObject):
                     if not scene_dir.is_dir():
                         self.emitter.message.emit(f"Skip missing scene {scene_name}")
                         continue
-                    img_paths = pp.gather_images(
-                        scene_dir,
-                        pattern=self.settings.pattern,
-                        patterns_raw=self.settings.patterns_raw,
-                        recursive=self.settings.recursive,
-                    )
-                    if self.settings.max_images > 0:
-                        img_paths = img_paths[:self.settings.max_images]
-                    global_bbox = None
-                    if self.settings.union_bbox and img_paths:
-                        self.emitter.message.emit(f"Computing union bbox for {scene_name} ({len(img_paths)} images)...")
-                        global_bbox = pp.compute_union_bbox(img_paths, args)
+
+                    img_paths = scene_img_map.get(scene_name, [])
                     metas = []
                     out_dir = self.settings.output_root / scene_name
                     out_dir.mkdir(parents=True, exist_ok=True)
+
                     for p in img_paths:
                         if self._cancel:
                             self.emitter.message.emit('Cancellation requested... stopping.')
                             break
+                        # Use the global bbox for all scenes
                         meta = pp.process_image(p, out_dir, args, global_bbox=global_bbox)
                         metas.append(meta)
                         processed += 1
                         self.emitter.progress.emit(processed, total)
+
                     with open(out_dir / 'metadata.json', 'w') as f:
                         import json
                         json.dump({'scene': scene_name, 'images': metas, 'union_bbox': global_bbox}, f, indent=2)
@@ -176,16 +183,17 @@ class Worker(QtCore.QObject):
 class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('NeRF Preprocess')
-        self.resize(980, 760)
+        self.setWindowTitle('Background Removal & Image Processor')
+        self.resize(1100, 700)
+        self.setMinimumSize(800, 600)
         self.emitter = LogEmitter()
         self.worker_thread = None
         self.worker = None
-        self._use_custom_style = False  # start with system style
+        self._use_custom_style = True  # start with modern custom style
         self._detected_mode = None  # 'flat', 'scene', or None
         self._build_ui()
         self._connect_signals()
-        self._apply_style()  # applies (currently system/default)
+        self._apply_style()  # applies modern style
         # Initial setup
         self._auto_output_dir()
         self._toggle_ai_deps()
@@ -195,46 +203,65 @@ class MainWindow(QtWidgets.QWidget):
             widget.setVisible(False)
 
     def _build_ui(self):
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setSpacing(12)
-        layout.setContentsMargins(16, 16, 16, 16)
+        # Create main scroll area for responsive layout
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scroll_widget = QtWidgets.QWidget()
+        scroll.setWidget(scroll_widget)
 
-        # Paths group
-        paths_group = QtWidgets.QGroupBox('Input & Output')
+        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(scroll)
+
+        layout = QtWidgets.QVBoxLayout(scroll_widget)
+        layout.setSpacing(10)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        # Paths group - compact
+        paths_group = QtWidgets.QGroupBox('📁 Input & Output')
         pg_layout = QtWidgets.QGridLayout(paths_group)
-        pg_layout.setSpacing(8)
+        pg_layout.setSpacing(6)
+        pg_layout.setContentsMargins(8, 12, 8, 8)
         self.input_edit = QtWidgets.QLineEdit()
         self.input_edit.setPlaceholderText('Select your input folder...')
-        self.output_edit = QtWidgets.QLineEdit(); self.output_edit.setReadOnly(True)
-        in_btn = QtWidgets.QPushButton('Browse...')
-        out_btn = QtWidgets.QPushButton('Regenerate')
+        self.output_edit = QtWidgets.QLineEdit()
+        self.output_edit.setReadOnly(True)
+        in_btn = QtWidgets.QPushButton('Browse')
+        in_btn.setMaximumWidth(80)
+        out_btn = QtWidgets.QPushButton('↻')
+        out_btn.setMaximumWidth(40)
+        out_btn.setToolTip('Regenerate output folder name')
         in_btn.clicked.connect(lambda: self._pick_dir(self.input_edit))
         out_btn.clicked.connect(self._auto_output_dir)
         self.input_edit.textChanged.connect(self._on_input_changed)
-        pg_layout.addWidget(QtWidgets.QLabel('Input Folder:'), 0,0)
-        pg_layout.addWidget(self.input_edit, 0,1)
-        pg_layout.addWidget(in_btn, 0,2)
-        pg_layout.addWidget(QtWidgets.QLabel('Output Folder:'), 1,0)
-        pg_layout.addWidget(self.output_edit, 1,1)
-        pg_layout.addWidget(out_btn, 1,2)
+        pg_layout.addWidget(QtWidgets.QLabel('Input:'), 0, 0)
+        pg_layout.addWidget(self.input_edit, 0, 1)
+        pg_layout.addWidget(in_btn, 0, 2)
+        pg_layout.addWidget(QtWidgets.QLabel('Output:'), 1, 0)
+        pg_layout.addWidget(self.output_edit, 1, 1)
+        pg_layout.addWidget(out_btn, 1, 2)
         layout.addWidget(paths_group)
 
-        # Image source info
-        self.source_info_group = QtWidgets.QGroupBox('Detected Images')
+        # Image source info - compact
+        self.source_info_group = QtWidgets.QGroupBox('🖼️ Detected Images')
         info_layout = QtWidgets.QVBoxLayout(self.source_info_group)
-        info_layout.setSpacing(8)
+        info_layout.setSpacing(6)
+        info_layout.setContentsMargins(8, 12, 8, 8)
         self.source_info_label = QtWidgets.QLabel('Select input folder to detect images...')
         self.source_info_label.setWordWrap(True)
-        self.source_info_label.setStyleSheet('color: #666; font-style: italic;')
+        self.source_info_label.setStyleSheet('padding: 4px; color: #666; font-style: italic;')
         info_layout.addWidget(self.source_info_label)
 
         # Scene list (will be shown if scenes detected)
         self.scene_list = QtWidgets.QListWidget()
         self.scene_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.MultiSelection)
+        self.scene_list.setMaximumHeight(120)
         self.scene_list.setVisible(False)
         btn_row = QtWidgets.QHBoxLayout()
-        btn_row.setSpacing(8)
+        btn_row.setSpacing(6)
         self.select_all_btn = QtWidgets.QPushButton('Select All')
+        self.select_all_btn.setMaximumWidth(100)
         self.select_all_btn.setVisible(False)
         btn_row.addWidget(self.select_all_btn)
         btn_row.addStretch()
@@ -242,10 +269,39 @@ class MainWindow(QtWidgets.QWidget):
         info_layout.addWidget(self.scene_list)
         layout.addWidget(self.source_info_group)
 
-        # Processing Options
-        opts_group = QtWidgets.QGroupBox('Processing Options')
+        # Live Preview Section
+        preview_group = QtWidgets.QGroupBox('👁️ Live Preview')
+        preview_layout = QtWidgets.QVBoxLayout(preview_group)
+        preview_layout.setSpacing(6)
+        preview_layout.setContentsMargins(8, 12, 8, 8)
+
+        # Preview controls
+        preview_controls = QtWidgets.QHBoxLayout()
+        preview_controls.setSpacing(6)
+        self.preview_btn = QtWidgets.QPushButton('🔍 Generate Preview')
+        self.preview_btn.setToolTip('Preview detection on a random sample image')
+        self.preview_btn.clicked.connect(self._generate_preview)
+        preview_controls.addWidget(self.preview_btn)
+        preview_controls.addStretch()
+        preview_layout.addLayout(preview_controls)
+
+        # Preview image display
+        self.preview_label = QtWidgets.QLabel()
+        self.preview_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setMinimumHeight(200)
+        self.preview_label.setMaximumHeight(300)
+        self.preview_label.setStyleSheet('QLabel { background: #f8f9fa; border: 2px dashed #dee2e6; border-radius: 8px; color: #6c757d; }')
+        self.preview_label.setText('Click "Generate Preview" to see detection result')
+        self.preview_label.setScaledContents(False)
+        preview_layout.addWidget(self.preview_label)
+
+        layout.addWidget(preview_group)
+
+        # Processing Options - compact
+        opts_group = QtWidgets.QGroupBox('⚙️ Processing Options')
         og_layout = QtWidgets.QGridLayout(opts_group)
-        og_layout.setSpacing(8)
+        og_layout.setSpacing(6)
+        og_layout.setContentsMargins(8, 12, 8, 8)
         og_layout.setColumnStretch(1, 1)
         row = 0
 
@@ -256,6 +312,7 @@ class MainWindow(QtWidgets.QWidget):
             nonlocal row
             label = QtWidgets.QLabel(lbl + ':')
             label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            label.setMinimumWidth(120)
             og_layout.addWidget(label, row, 0)
             og_layout.addWidget(widget, row, 1)
             if is_advanced:
@@ -277,11 +334,17 @@ class MainWindow(QtWidgets.QWidget):
         self.ai_seg_cb.setChecked(True)
         self.ai_seg_cb.setToolTip('High quality background removal using rembg')
 
+        # Padding mode - mutually exclusive
+        self.pad_mode_absolute = QtWidgets.QRadioButton('Absolute (pixels)')
+        self.pad_mode_relative = QtWidgets.QRadioButton('Relative (%)')
+        self.pad_mode_relative.setChecked(True)
+
         self.pad_spin = QtWidgets.QSpinBox()
         self.pad_spin.setRange(0, 400)
         self.pad_spin.setValue(8)
         self.pad_spin.setSuffix(' px')
         self.pad_spin.setToolTip('Extra pixels around detected object')
+        self.pad_spin.setEnabled(False)
 
         self.pad_rel_spin = QtWidgets.QSpinBox()
         self.pad_rel_spin.setRange(0, 100)
@@ -289,8 +352,15 @@ class MainWindow(QtWidgets.QWidget):
         self.pad_rel_spin.setSuffix(' %')
         self.pad_rel_spin.setToolTip('Relative padding as % of object size')
 
+        # Connect radio buttons to enable/disable spinboxes and update preview
+        self.pad_mode_absolute.toggled.connect(lambda checked: self.pad_spin.setEnabled(checked))
+        self.pad_mode_relative.toggled.connect(lambda checked: self.pad_rel_spin.setEnabled(checked))
+        self.pad_mode_absolute.toggled.connect(self._on_preview_settings_changed)
+        self.pad_spin.valueChanged.connect(self._on_preview_settings_changed)
+        self.pad_rel_spin.valueChanged.connect(self._on_preview_settings_changed)
+
         self.union_cb = QtWidgets.QCheckBox()
-        self.union_cb.setToolTip('Use same crop box for all images (consistent framing)')
+        self.union_cb.setToolTip('Use single bounding box computed from ALL images across all scenes (ensures globally consistent size)')
 
         self.square_cb = QtWidgets.QCheckBox()
         self.square_cb.setToolTip('Force square output (1:1 aspect ratio)')
@@ -346,9 +416,19 @@ class MainWindow(QtWidgets.QWidget):
         # Add main options
         add_row('Preset', self.preset_combo)
         add_row('AI Segmentation', self.ai_seg_cb)
-        add_row('Padding (absolute)', self.pad_spin)
-        add_row('Padding (relative)', self.pad_rel_spin)
-        add_row('Consistent Crop', self.union_cb)
+
+        # Padding mode selector
+        pad_mode_widget = QtWidgets.QWidget()
+        pad_mode_layout = QtWidgets.QHBoxLayout(pad_mode_widget)
+        pad_mode_layout.setContentsMargins(0, 0, 0, 0)
+        pad_mode_layout.addWidget(self.pad_mode_absolute)
+        pad_mode_layout.addWidget(self.pad_mode_relative)
+        pad_mode_layout.addStretch()
+        add_row('Padding Mode', pad_mode_widget)
+
+        add_row('Absolute Padding', self.pad_spin)
+        add_row('Relative Padding', self.pad_rel_spin)
+        add_row('Consistent Size (Global)', self.union_cb)
         add_row('Force Square', self.square_cb)
         add_row('Save Mask', self.save_mask_cb)
         add_row('Save RGBA', self.save_rgba_cb)
@@ -374,45 +454,57 @@ class MainWindow(QtWidgets.QWidget):
         # Connect signals
         self.adv_toggle.toggled.connect(self._toggle_advanced)
         self.ai_seg_cb.toggled.connect(self._toggle_ai_deps)
+        self.ai_seg_cb.toggled.connect(self._on_preview_settings_changed)
         self.preset_combo.currentTextChanged.connect(self._apply_preset)
+        self.square_cb.toggled.connect(self._on_preview_settings_changed)
+        self.union_cb.toggled.connect(self._on_preview_settings_changed)
 
         layout.addWidget(opts_group)
 
-        # Run controls
+        # Run controls - modern compact
+        run_group = QtWidgets.QGroupBox('▶️ Run')
+        run_group_layout = QtWidgets.QVBoxLayout(run_group)
+        run_group_layout.setSpacing(6)
+        run_group_layout.setContentsMargins(8, 12, 8, 8)
+
         run_row = QtWidgets.QHBoxLayout()
-        run_row.setSpacing(8)
-        self.run_btn = QtWidgets.QPushButton('▶ Run Processing')
-        self.run_btn.setMinimumHeight(36)
-        font = self.run_btn.font()
-        font.setPointSize(font.pointSize() + 1)
-        font.setBold(True)
-        self.run_btn.setFont(font)
-        self.cancel_btn = QtWidgets.QPushButton('Cancel'); self.cancel_btn.setEnabled(False)
-        self.theme_btn = QtWidgets.QPushButton('Toggle Theme')
+        run_row.setSpacing(6)
+        self.run_btn = QtWidgets.QPushButton('▶ Start Processing')
+        self.run_btn.setMinimumHeight(40)
+        self.cancel_btn = QtWidgets.QPushButton('⏹ Cancel')
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setMaximumWidth(100)
         run_row.addWidget(self.run_btn, 3)
         run_row.addWidget(self.cancel_btn, 1)
-        run_row.addWidget(self.theme_btn, 1)
-        self.progress = QtWidgets.QProgressBar(); self.progress.setValue(0); self.progress.setTextVisible(True)
-        layout.addLayout(run_row)
-        layout.addWidget(self.progress)
 
-        # Log area
-        log_label = QtWidgets.QLabel('Processing Log:')
-        layout.addWidget(log_label)
-        self.log_edit = QtWidgets.QPlainTextEdit(); self.log_edit.setReadOnly(True)
-        self.log_edit.setMinimumHeight(150)
-        layout.addWidget(self.log_edit, stretch=1)
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setValue(0)
+        self.progress.setTextVisible(True)
+        self.progress.setMaximumHeight(24)
 
-        # Footer / status
         self.status_label = QtWidgets.QLabel('Ready')
-        self.status_label.setStyleSheet('font-weight: bold;')
-        layout.addWidget(self.status_label)
+        self.status_label.setStyleSheet('padding: 4px; font-weight: bold;')
+
+        run_group_layout.addLayout(run_row)
+        run_group_layout.addWidget(self.progress)
+        run_group_layout.addWidget(self.status_label)
+        layout.addWidget(run_group)
+
+        # Log area - collapsible
+        log_group = QtWidgets.QGroupBox('📋 Processing Log')
+        log_layout = QtWidgets.QVBoxLayout(log_group)
+        log_layout.setSpacing(6)
+        log_layout.setContentsMargins(8, 12, 8, 8)
+        self.log_edit = QtWidgets.QPlainTextEdit()
+        self.log_edit.setReadOnly(True)
+        self.log_edit.setMaximumHeight(120)
+        log_layout.addWidget(self.log_edit)
+        layout.addWidget(log_group)
 
         # Button connections
         self.select_all_btn.clicked.connect(self._select_all_scenes)
         self.run_btn.clicked.connect(self._start)
         self.cancel_btn.clicked.connect(self._cancel)
-        self.theme_btn.clicked.connect(self._toggle_theme)
 
     def _pick_dir(self, line_edit: QtWidgets.QLineEdit):
         d = QtWidgets.QFileDialog.getExistingDirectory(self, 'Select Directory')
@@ -426,6 +518,16 @@ class MainWindow(QtWidgets.QWidget):
         root = self.input_edit.text().strip()
         if root and Path(root).is_dir():
             self._detect_images()
+            # Clear preview when input changes
+            self._preview_image_path = None
+            self.preview_label.clear()
+            self.preview_label.setText('Click "Generate Preview" to see detection result')
+
+    def _on_preview_settings_changed(self):
+        """Called when any preview-affecting setting changes."""
+        # Auto-regenerate preview if we have a cached image
+        if hasattr(self, '_preview_image_path') and self._preview_image_path:
+            self._generate_preview()
 
     def _detect_images(self):
         """Automatically detect images and scenes intelligently."""
@@ -498,6 +600,107 @@ class MainWindow(QtWidgets.QWidget):
             item = self.scene_list.item(i)
             item.setSelected(True)
 
+    def _generate_preview(self):
+        """Generate a preview of the detection on a sample image."""
+        import random
+
+        root = self.input_edit.text().strip()
+        if not root or not Path(root).is_dir():
+            QtWidgets.QMessageBox.warning(self, 'Error', 'Please select a valid input folder first')
+            return
+
+        try:
+            # Get sample image
+            if not hasattr(self, '_preview_image_path') or not self._preview_image_path:
+                # Pick a random image from detected images
+                if self._detected_mode == 'flat':
+                    img_paths = pp.gather_images(Path(root), patterns_raw='', recursive=False)
+                elif self._detected_mode == 'scene':
+                    # Pick from first selected scene or first scene
+                    selected = [i.text() for i in self.scene_list.selectedItems()]
+                    if selected:
+                        scene_dir = Path(root) / selected[0]
+                    else:
+                        # Pick first scene
+                        scene_dir = Path(root) / self.scene_list.item(0).text()
+                    img_paths = pp.gather_images(scene_dir, patterns_raw='', recursive=False)
+                else:
+                    QtWidgets.QMessageBox.warning(self, 'Error', 'No images detected')
+                    return
+
+                if not img_paths:
+                    QtWidgets.QMessageBox.warning(self, 'Error', 'No images found')
+                    return
+
+                self._preview_image_path = random.choice(img_paths)
+
+            # Load image
+            img = pp.load_image(self._preview_image_path, None)
+
+            # Get current settings
+            use_ai = self.ai_seg_cb.isChecked()
+
+            # Compute mask
+            if use_ai:
+                if not pp.REMBG_AVAILABLE:
+                    QtWidgets.QMessageBox.warning(self, 'Error', 'rembg not installed. Install with: pip install rembg')
+                    return
+                mask = pp.ai_segment(img, 'u2net')
+                _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+            else:
+                mask = pp.compute_foreground_mask(img, channel='auto', method='otsu', invert=True, blur=3)
+
+            mask = pp.refine_mask(mask, morph_kernel=5, dilate=2, erode=0, keep_largest=True)
+
+            # Calculate padding
+            if self.pad_mode_absolute.isChecked():
+                pad_px = self.pad_spin.value()
+                pad_rel = 0.0
+            else:
+                pad_px = 0
+                pad_rel = self.pad_rel_spin.value() / 100.0
+
+            # Get bbox
+            bbox = pp.mask_to_bbox(mask, pad=pad_px, square=self.square_cb.isChecked(), pad_rel=pad_rel)
+
+            # Draw preview
+            if img.ndim == 2:
+                rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            else:
+                rgb = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+            # Draw bbox
+            x0, y0, x1, y1 = bbox
+            cv2.rectangle(rgb, (x0, y0), (x1, y1), (0, 255, 0), 3)
+
+            # Add text
+            text = f"BBox: {x1-x0}x{y1-y0} px"
+            cv2.putText(rgb, text, (x0, y0-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            # Scale to fit preview
+            h, w = rgb.shape[:2]
+            max_h = 280
+            max_w = self.preview_label.width() - 20
+            scale = min(max_h / h, max_w / w, 1.0)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            rgb = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            # Convert to QPixmap
+            h, w, ch = rgb.shape
+            bytes_per_line = ch * w
+            qt_image = QtGui.QImage(rgb.data, w, h, bytes_per_line, QtGui.QImage.Format.Format_BGR888)
+            pixmap = QtGui.QPixmap.fromImage(qt_image)
+
+            self.preview_label.setPixmap(pixmap)
+            self.preview_label.setStyleSheet('QLabel { background: white; border: 2px solid #0d6efd; border-radius: 8px; }')
+
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            QtWidgets.QMessageBox.critical(self, 'Preview Error', f'Failed to generate preview:\n{e}\n\n{tb}')
+            self.preview_label.setText(f'Preview failed: {e}')
+
     def _collect_settings(self) -> Optional[GUISettings]:
         try:
             input_root = Path(self.input_edit.text().strip())
@@ -521,7 +724,14 @@ class MainWindow(QtWidgets.QWidget):
                     QtWidgets.QMessageBox.warning(self, 'Error', 'Select at least one scene')
                     return None
 
-            pad_rel_fraction = self.pad_rel_spin.value() / 100.0
+            # Use only active padding mode
+            if self.pad_mode_absolute.isChecked():
+                pad_px = self.pad_spin.value()
+                pad_rel = 0.0
+            else:
+                pad_px = 0
+                pad_rel = self.pad_rel_spin.value() / 100.0
+
             bayer_val = self.bayer_combo.currentText()
             if bayer_val == 'Auto/None':
                 bayer_val = None
@@ -532,8 +742,8 @@ class MainWindow(QtWidgets.QWidget):
                 flat_mode=flat_mode,
                 method=self.method_combo.currentText(),
                 percentile=self.percentile_spin.value(),
-                pad=self.pad_spin.value(),
-                pad_rel=pad_rel_fraction,
+                pad=pad_px,
+                pad_rel=pad_rel,
                 union_bbox=self.union_cb.isChecked(),
                 square=self.square_cb.isChecked(),
                 save_mask=self.save_mask_cb.isChecked(),
@@ -689,58 +899,160 @@ class MainWindow(QtWidgets.QWidget):
 
     def _apply_style(self):
         if not self._use_custom_style:
-            # Restore system style: clear stylesheet
             self.setStyleSheet("")
-            pal = self.palette()
-            # Ensure base contrast (if system is light, keep; if dark, trust system)
-            self.setPalette(pal)
             return
 
-        # Adaptive custom theme (light/dark based on system base color luminance)
-        pal = self.palette()
-        base_color = pal.color(pal.ColorRole.Base)
-        # Simple luminance check
-        luminance = (0.2126*base_color.redF() + 0.7152*base_color.greenF() + 0.0722*base_color.blueF())
-        dark = luminance < 0.5
-        if dark:
-            bg0 = '#1F1F22'
-            bg1 = '#2A2A2E'
-            panel = '#242428'
-            border = '#3A3A40'
-            text = '#EDEDED'
-            accent = '#4A90E2'
-            accent_dim = '#2F6CB2'
-            progress_chunk = accent
-        else:
-            bg0 = '#F4F4F6'
-            bg1 = '#FFFFFF'
-            panel = '#FFFFFF'
-            border = '#D7D7DA'
-            text = '#202124'
-            accent = '#3578E5'
-            accent_dim = '#2B63BD'
-            progress_chunk = accent
-
-        self.setStyleSheet(f'''
-            QWidget {{ background: {bg0}; font-family: "Segoe UI", "Helvetica Neue", Arial; color:{text}; }}
-            QGroupBox {{ font-weight:600; border:1px solid {border}; border-radius:10px; margin-top:8px; padding:8px 10px 10px 10px; background:{panel}; }}
-            QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding:2px 4px; background: transparent; }}
-            QPushButton {{ background:{bg1}; border:1px solid {border}; border-radius:10px; padding:6px 14px; color:{text}; }}
-            QPushButton:hover {{ border-color:{accent}; }}
-            QPushButton:pressed {{ background:{accent}22; }}
-            QPushButton:disabled {{ color: #888; background:{bg0}; }}
-            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{ background:{bg1}; border:1px solid {border}; border-radius:8px; padding:4px 6px; color:{text}; }}
-            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{ border:1px solid {accent}; }}
-            QProgressBar {{ border:1px solid {border}; border-radius:10px; text-align:center; height:20px; background:{panel}; color:{text}; }}
-            QProgressBar::chunk {{ background-color:{progress_chunk}; border-radius:10px; }}
-            QPlainTextEdit {{ background:{bg1}; border:1px solid {border}; border-radius:10px; color:{text}; }}
-            QListWidget {{ background:{bg1}; border:1px solid {border}; border-radius:8px; }}
-            QLabel {{ color:{text}; }}
-            QScrollBar:vertical {{ background: {panel}; width:12px; margin:2px; border-radius:6px; }}
-            QScrollBar::handle:vertical {{ background:{border}; border-radius:6px; min-height:24px; }}
-            QScrollBar::handle:vertical:hover {{ background:{accent}; }}
-            QScrollBar::add-line, QScrollBar::sub-line {{ height:0; }}
+        # Modern gradient style - always light theme
+        self.setStyleSheet('''
+            QWidget {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #f8f9fa, stop:1 #e9ecef);
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+                font-size: 13px;
+                color: #212529;
+            }
+            QGroupBox {
+                font-weight: 600;
+                font-size: 13px;
+                border: 1px solid #dee2e6;
+                border-radius: 12px;
+                margin-top: 12px;
+                padding: 12px;
+                background: white;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 16px;
+                padding: 0 8px;
+                background: white;
+            }
+            QPushButton {
+                background: white;
+                border: 1px solid #dee2e6;
+                border-radius: 8px;
+                padding: 8px 16px;
+                color: #212529;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background: #f8f9fa;
+                border-color: #0d6efd;
+            }
+            QPushButton:pressed {
+                background: #e9ecef;
+            }
+            QPushButton:disabled {
+                color: #adb5bd;
+                background: #f8f9fa;
+                border-color: #dee2e6;
+            }
+            QPushButton#run_btn {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #0d6efd, stop:1 #0a58ca);
+                color: white;
+                border: none;
+            }
+            QPushButton#run_btn:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #0a58ca, stop:1 #084298);
+            }
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+                background: white;
+                border: 1px solid #ced4da;
+                border-radius: 6px;
+                padding: 6px 10px;
+                color: #212529;
+            }
+            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
+                border: 2px solid #0d6efd;
+                padding: 5px 9px;
+            }
+            QLineEdit:read-only {
+                background: #f8f9fa;
+                color: #6c757d;
+            }
+            QProgressBar {
+                border: 1px solid #dee2e6;
+                border-radius: 8px;
+                text-align: center;
+                background: white;
+                color: #212529;
+                font-weight: 500;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #0d6efd, stop:1 #0dcaf0);
+                border-radius: 7px;
+            }
+            QPlainTextEdit {
+                background: #f8f9fa;
+                border: 1px solid #dee2e6;
+                border-radius: 8px;
+                color: #212529;
+                padding: 8px;
+                font-family: "Consolas", "Monaco", monospace;
+                font-size: 12px;
+            }
+            QListWidget {
+                background: white;
+                border: 1px solid #dee2e6;
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QListWidget::item {
+                border-radius: 4px;
+                padding: 6px 8px;
+            }
+            QListWidget::item:selected {
+                background: #e7f1ff;
+                color: #0d6efd;
+            }
+            QListWidget::item:hover {
+                background: #f8f9fa;
+            }
+            QScrollArea {
+                border: none;
+                background: transparent;
+            }
+            QScrollBar:vertical {
+                background: #f8f9fa;
+                width: 10px;
+                margin: 0;
+                border-radius: 5px;
+            }
+            QScrollBar::handle:vertical {
+                background: #ced4da;
+                border-radius: 5px;
+                min-height: 30px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #adb5bd;
+            }
+            QScrollBar::add-line, QScrollBar::sub-line {
+                height: 0;
+            }
+            QCheckBox {
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border: 2px solid #ced4da;
+                border-radius: 4px;
+                background: white;
+            }
+            QCheckBox::indicator:checked {
+                background: #0d6efd;
+                border-color: #0d6efd;
+                image: url(data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTIiIGhlaWdodD0iOSIgdmlld0JveD0iMCAwIDEyIDkiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHBhdGggZD0iTTEgNEw0LjUgNy41TDExIDEiIHN0cm9rZT0id2hpdGUiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+PC9zdmc+);
+            }
+            QCheckBox::indicator:hover {
+                border-color: #0d6efd;
+            }
         ''')
+        # Set object name for the run button to apply special styling
+        self.run_btn.setObjectName('run_btn')
 
     def _toggle_theme(self):
         self._use_custom_style = not self._use_custom_style
