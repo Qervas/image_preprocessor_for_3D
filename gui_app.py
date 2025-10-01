@@ -15,6 +15,7 @@ class GUISettings:
     input_root: Path
     output_root: Path
     scenes: List[str]
+    flat_mode: bool = False  # if True, process images directly from input_root
     pattern: str = 'cam_*.tiff'
     patterns_raw: str = ''  # semicolon separated patterns; empty => any supported image extensions
     recursive: bool = False
@@ -62,20 +63,8 @@ class Worker(QtCore.QObject):
         try:
             input_root = self.settings.input_root
             scenes = self.settings.scenes
+            flat_mode = self.settings.flat_mode
             total = 0
-            # gather images count for progress baseline
-            for s in scenes:
-                scene_dir = input_root / s
-                imgs = pp.gather_images(
-                    scene_dir,
-                    pattern=self.settings.pattern,
-                    patterns_raw=self.settings.patterns_raw,
-                    recursive=self.settings.recursive,
-                )
-                if self.settings.max_images > 0:
-                    imgs = imgs[:self.settings.max_images]
-                total += len(imgs)
-            processed = 0
 
             class Args:  # lightweight adapter passed into existing functions
                 pass
@@ -88,29 +77,29 @@ class Worker(QtCore.QObject):
             # Flags compatibility
             setattr(args, 'no_keep_largest', self.settings.no_keep_largest)
 
-            for scene_name in scenes:
-                if self._cancel:
-                    self.emitter.message.emit('Cancelled before scene '+scene_name)
-                    break
-                scene_dir = input_root / scene_name
-                if not scene_dir.is_dir():
-                    self.emitter.message.emit(f"Skip missing scene {scene_name}")
-                    continue
+            if flat_mode:
+                # Flat mode: process all images from input_root directly
+                self.emitter.message.emit('Flat mode: processing images from root directory...')
                 img_paths = pp.gather_images(
-                    scene_dir,
+                    input_root,
                     pattern=self.settings.pattern,
                     patterns_raw=self.settings.patterns_raw,
                     recursive=self.settings.recursive,
                 )
                 if self.settings.max_images > 0:
                     img_paths = img_paths[:self.settings.max_images]
+                total = len(img_paths)
+                self.emitter.message.emit(f"Found {total} images in root directory")
+
                 global_bbox = None
                 if self.settings.union_bbox and img_paths:
-                    self.emitter.message.emit(f"Computing union bbox for {scene_name} ({len(img_paths)} images)...")
+                    self.emitter.message.emit(f"Computing union bbox ({len(img_paths)} images)...")
                     global_bbox = pp.compute_union_bbox(img_paths, args)
+
                 metas = []
-                out_dir = self.settings.output_root / scene_name
+                out_dir = self.settings.output_root
                 out_dir.mkdir(parents=True, exist_ok=True)
+                processed = 0
                 for p in img_paths:
                     if self._cancel:
                         self.emitter.message.emit('Cancellation requested... stopping.')
@@ -121,8 +110,60 @@ class Worker(QtCore.QObject):
                     self.emitter.progress.emit(processed, total)
                 with open(out_dir / 'metadata.json', 'w') as f:
                     import json
-                    json.dump({'scene': scene_name, 'images': metas, 'union_bbox': global_bbox}, f, indent=2)
-                self.emitter.message.emit(f"Scene {scene_name} done: {len(metas)} images")
+                    json.dump({'images': metas, 'union_bbox': global_bbox}, f, indent=2)
+                self.emitter.message.emit(f"Processed {len(metas)} images")
+            else:
+                # Scene mode: organize by subfolders
+                # gather images count for progress baseline
+                for s in scenes:
+                    scene_dir = input_root / s
+                    imgs = pp.gather_images(
+                        scene_dir,
+                        pattern=self.settings.pattern,
+                        patterns_raw=self.settings.patterns_raw,
+                        recursive=self.settings.recursive,
+                    )
+                    if self.settings.max_images > 0:
+                        imgs = imgs[:self.settings.max_images]
+                    total += len(imgs)
+                processed = 0
+
+                for scene_name in scenes:
+                    if self._cancel:
+                        self.emitter.message.emit('Cancelled before scene '+scene_name)
+                        break
+                    scene_dir = input_root / scene_name
+                    if not scene_dir.is_dir():
+                        self.emitter.message.emit(f"Skip missing scene {scene_name}")
+                        continue
+                    img_paths = pp.gather_images(
+                        scene_dir,
+                        pattern=self.settings.pattern,
+                        patterns_raw=self.settings.patterns_raw,
+                        recursive=self.settings.recursive,
+                    )
+                    if self.settings.max_images > 0:
+                        img_paths = img_paths[:self.settings.max_images]
+                    global_bbox = None
+                    if self.settings.union_bbox and img_paths:
+                        self.emitter.message.emit(f"Computing union bbox for {scene_name} ({len(img_paths)} images)...")
+                        global_bbox = pp.compute_union_bbox(img_paths, args)
+                    metas = []
+                    out_dir = self.settings.output_root / scene_name
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    for p in img_paths:
+                        if self._cancel:
+                            self.emitter.message.emit('Cancellation requested... stopping.')
+                            break
+                        meta = pp.process_image(p, out_dir, args, global_bbox=global_bbox)
+                        metas.append(meta)
+                        processed += 1
+                        self.emitter.progress.emit(processed, total)
+                    with open(out_dir / 'metadata.json', 'w') as f:
+                        import json
+                        json.dump({'scene': scene_name, 'images': metas, 'union_bbox': global_bbox}, f, indent=2)
+                    self.emitter.message.emit(f"Scene {scene_name} done: {len(metas)} images")
+
             if self._cancel:
                 self.emitter.finished.emit(False, 'Cancelled')
             else:
@@ -147,49 +188,77 @@ class MainWindow(QtWidgets.QWidget):
         # Initial setup
         self._auto_output_dir()
         self._toggle_ai_deps()
+        # Hide advanced options by default
+        for w in self._advanced_widgets:
+            w_parent = w.parentWidget()
+            if w_parent:
+                w_parent.setVisible(False)
+            w.setVisible(False)
 
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
 
         # Paths group
-        paths_group = QtWidgets.QGroupBox('Paths')
+        paths_group = QtWidgets.QGroupBox('Input & Output')
         pg_layout = QtWidgets.QGridLayout(paths_group)
+        pg_layout.setSpacing(8)
         self.input_edit = QtWidgets.QLineEdit()
+        self.input_edit.setPlaceholderText('Select your input folder...')
         self.output_edit = QtWidgets.QLineEdit(); self.output_edit.setReadOnly(True)
-        in_btn = QtWidgets.QPushButton('Choose Input Folder…')
-        out_btn = QtWidgets.QPushButton('Regenerate Output')
+        in_btn = QtWidgets.QPushButton('Browse...')
+        out_btn = QtWidgets.QPushButton('Regenerate')
         in_btn.clicked.connect(lambda: self._pick_dir(self.input_edit))
         out_btn.clicked.connect(self._auto_output_dir)
         self.input_edit.textChanged.connect(lambda: self._auto_output_dir())
-        pg_layout.addWidget(QtWidgets.QLabel('Input Folder'), 0,0)
+        pg_layout.addWidget(QtWidgets.QLabel('Input Folder:'), 0,0)
         pg_layout.addWidget(self.input_edit, 0,1)
         pg_layout.addWidget(in_btn, 0,2)
-        pg_layout.addWidget(QtWidgets.QLabel('Output Folder (auto)'), 1,0)
+        pg_layout.addWidget(QtWidgets.QLabel('Output Folder:'), 1,0)
         pg_layout.addWidget(self.output_edit, 1,1)
         pg_layout.addWidget(out_btn, 1,2)
         layout.addWidget(paths_group)
 
+        # Image source mode group
+        mode_group = QtWidgets.QGroupBox('Image Source')
+        mode_layout = QtWidgets.QVBoxLayout(mode_group)
+        mode_layout.setSpacing(8)
+
+        self.mode_scene_radio = QtWidgets.QRadioButton('Organize by scenes (subfolders)')
+        self.mode_flat_radio = QtWidgets.QRadioButton('All images in root directory')
+        self.mode_scene_radio.setChecked(True)
+        self.mode_scene_radio.toggled.connect(self._toggle_mode)
+
+        mode_layout.addWidget(self.mode_scene_radio)
+        mode_layout.addWidget(self.mode_flat_radio)
+        layout.addWidget(mode_group)
+
         # Scenes group
-        scene_group = QtWidgets.QGroupBox('Scenes')
-        sg_layout = QtWidgets.QVBoxLayout(scene_group)
+        self.scene_group = QtWidgets.QGroupBox('Select Scenes')
+        sg_layout = QtWidgets.QVBoxLayout(self.scene_group)
+        sg_layout.setSpacing(8)
         btn_row = QtWidgets.QHBoxLayout()
+        btn_row.setSpacing(8)
         self.refresh_scenes_btn = QtWidgets.QPushButton('Discover Scenes')
         self.select_all_btn = QtWidgets.QPushButton('Select All')
         btn_row.addWidget(self.refresh_scenes_btn)
         btn_row.addWidget(self.select_all_btn)
+        btn_row.addStretch()
         self.scene_list = QtWidgets.QListWidget()
         self.scene_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.MultiSelection)
         sg_layout.addLayout(btn_row)
         sg_layout.addWidget(self.scene_list)
-        layout.addWidget(scene_group)
+        layout.addWidget(self.scene_group)
 
         # Processing Options
         opts_group = QtWidgets.QGroupBox('Processing Options')
         og_layout = QtWidgets.QGridLayout(opts_group)
+        og_layout.setSpacing(8)
         row = 0
         def add_row(lbl, widget):
             nonlocal row
-            og_layout.addWidget(QtWidgets.QLabel(lbl), row,0)
+            og_layout.addWidget(QtWidgets.QLabel(lbl + ':'), row,0, alignment=QtCore.Qt.AlignmentFlag.AlignRight)
             og_layout.addWidget(widget, row,1)
             row += 1
 
@@ -204,46 +273,52 @@ class MainWindow(QtWidgets.QWidget):
             'Classical Threshold Crop',
             'BBox Only Fast',
         ])
-        self.ai_seg_cb = QtWidgets.QCheckBox(); self.ai_seg_cb.setChecked(True); self.ai_seg_cb.setToolTip('High quality background removal using rembg.')
-        self.pad_spin = QtWidgets.QSpinBox(); self.pad_spin.setRange(0,400); self.pad_spin.setValue(8); self.pad_spin.setToolTip('Extra pixels added on each side.')
-        self.pad_rel_spin = QtWidgets.QSpinBox(); self.pad_rel_spin.setRange(0,100); self.pad_rel_spin.setValue(20); self.pad_rel_spin.setToolTip('Extra space percentage relative to bbox size (each side).')
-        self.union_cb = QtWidgets.QCheckBox(); self.union_cb.setToolTip('Use a single bounding box for all images in a scene.')
-        self.square_cb = QtWidgets.QCheckBox(); self.square_cb.setToolTip('Expand crop to square frame.')
+        self.ai_seg_cb = QtWidgets.QCheckBox(); self.ai_seg_cb.setChecked(True); self.ai_seg_cb.setToolTip('High quality background removal using rembg')
+        self.pad_spin = QtWidgets.QSpinBox(); self.pad_spin.setRange(0,400); self.pad_spin.setValue(8); self.pad_spin.setSuffix(' px'); self.pad_spin.setToolTip('Extra pixels added on each side')
+        self.pad_rel_spin = QtWidgets.QSpinBox(); self.pad_rel_spin.setRange(0,100); self.pad_rel_spin.setValue(20); self.pad_rel_spin.setSuffix(' %'); self.pad_rel_spin.setToolTip('Extra space percentage relative to bbox size')
+        self.union_cb = QtWidgets.QCheckBox(); self.union_cb.setToolTip('Use a single bounding box for all images in a scene')
+        self.square_cb = QtWidgets.QCheckBox(); self.square_cb.setToolTip('Expand crop to square frame')
         self.save_mask_cb = QtWidgets.QCheckBox(); self.save_mask_cb.setChecked(True)
         self.save_rgba_cb = QtWidgets.QCheckBox(); self.save_rgba_cb.setChecked(True)
-        self.rgba_opaque_cb = QtWidgets.QCheckBox(); self.rgba_opaque_cb.setToolTip('Save RGBA with full alpha (no transparency).')
+        self.rgba_opaque_cb = QtWidgets.QCheckBox(); self.rgba_opaque_cb.setToolTip('Save RGBA with full alpha (no transparency)')
         self.save_crop_cb = QtWidgets.QCheckBox()
-        self.bbox_only_cb = QtWidgets.QCheckBox(); self.bbox_only_cb.setToolTip('Only save cropped RGB region (no mask / rgba).')
+        self.bbox_only_cb = QtWidgets.QCheckBox(); self.bbox_only_cb.setToolTip('Only save cropped RGB region (no mask/rgba)')
         self.debug_cb = QtWidgets.QCheckBox(); self.debug_cb.setChecked(True)
         self.method_combo = QtWidgets.QComboBox(); self.method_combo.addItems(['otsu','percentile'])
         self.percentile_spin = QtWidgets.QDoubleSpinBox(); self.percentile_spin.setRange(0.9, 0.9999); self.percentile_spin.setDecimals(4); self.percentile_spin.setValue(0.995)
-        self.max_images_spin = QtWidgets.QSpinBox(); self.max_images_spin.setRange(0, 100000); self.max_images_spin.setValue(0); self.max_images_spin.setToolTip('0 = process all images.')
-        self.recursive_cb = QtWidgets.QCheckBox(); self.recursive_cb.setToolTip('Search subfolders recursively for images.')
-        self.patterns_edit = QtWidgets.QLineEdit(); self.patterns_edit.setPlaceholderText('Patterns (semicolon separated) e.g. *.png;*.jpg;frame_*.tif  (empty = any image)')
+        self.max_images_spin = QtWidgets.QSpinBox(); self.max_images_spin.setRange(0, 100000); self.max_images_spin.setValue(0); self.max_images_spin.setToolTip('0 = process all images')
+        self.recursive_cb = QtWidgets.QCheckBox(); self.recursive_cb.setToolTip('Search subfolders recursively for images')
+        self.patterns_edit = QtWidgets.QLineEdit(); self.patterns_edit.setPlaceholderText('e.g. *.png;*.jpg;frame_*.tif (empty = any)')
 
         add_row('Preset', self.preset_combo)
-        add_row('Demosaic (Bayer)', self.bayer_combo)
-        add_row('Recursive Search', self.recursive_cb)
-        add_row('Filename Patterns', self.patterns_edit)
         add_row('AI Segmentation', self.ai_seg_cb)
-        add_row('Padding (px)', self.pad_spin)
-        add_row('Extra Space (%)', self.pad_rel_spin)
-        add_row('Consistent Crop', self.union_cb)
-        add_row('Force Square', self.square_cb)
+        add_row('Padding', self.pad_spin)
+        add_row('Extra Space', self.pad_rel_spin)
         add_row('Save Mask', self.save_mask_cb)
-        add_row('Save RGBA (Alpha)', self.save_rgba_cb)
-        add_row('RGBA Opaque', self.rgba_opaque_cb)
+        add_row('Save RGBA', self.save_rgba_cb)
         add_row('Save Cropped RGB', self.save_crop_cb)
-        add_row('BBox Only (simple crop)', self.bbox_only_cb)
-        add_row('Debug Panels', self.debug_cb)
-        add_row('Mask Method', self.method_combo)
-        add_row('Percentile', self.percentile_spin)
+        add_row('Debug Visualization', self.debug_cb)
         add_row('Limit Images', self.max_images_spin)
 
         # Advanced section toggle
-        self.adv_toggle = QtWidgets.QPushButton('Hide Advanced'); self.adv_toggle.setCheckable(True)
+        self.adv_toggle = QtWidgets.QPushButton('▼ Show Advanced Options'); self.adv_toggle.setCheckable(True)
         og_layout.addWidget(self.adv_toggle, row,0,1,2); row += 1
-        self._advanced_widgets = [self.method_combo, self.percentile_spin, self.union_cb, self.square_cb, self.bayer_combo, self.patterns_edit, self.recursive_cb]
+
+        # Advanced widgets (initially hidden)
+        self._advanced_rows_start = row
+        add_row('Demosaic (Bayer)', self.bayer_combo)
+        add_row('Recursive Search', self.recursive_cb)
+        add_row('Filename Patterns', self.patterns_edit)
+        add_row('Consistent Crop', self.union_cb)
+        add_row('Force Square', self.square_cb)
+        add_row('RGBA Opaque', self.rgba_opaque_cb)
+        add_row('BBox Only', self.bbox_only_cb)
+        add_row('Mask Method', self.method_combo)
+        add_row('Percentile', self.percentile_spin)
+
+        self._advanced_widgets = [self.method_combo, self.percentile_spin, self.union_cb, self.square_cb,
+                                  self.bayer_combo, self.patterns_edit, self.recursive_cb, self.rgba_opaque_cb,
+                                  self.bbox_only_cb]
         self.adv_toggle.toggled.connect(self._toggle_advanced)
         self.ai_seg_cb.toggled.connect(self._toggle_ai_deps)
         self.preset_combo.currentTextChanged.connect(self._apply_preset)
@@ -251,22 +326,32 @@ class MainWindow(QtWidgets.QWidget):
 
         # Run controls
         run_row = QtWidgets.QHBoxLayout()
-        self.run_btn = QtWidgets.QPushButton('Run')
+        run_row.setSpacing(8)
+        self.run_btn = QtWidgets.QPushButton('▶ Run Processing')
+        self.run_btn.setMinimumHeight(36)
+        font = self.run_btn.font()
+        font.setPointSize(font.pointSize() + 1)
+        font.setBold(True)
+        self.run_btn.setFont(font)
         self.cancel_btn = QtWidgets.QPushButton('Cancel'); self.cancel_btn.setEnabled(False)
-        self.theme_btn = QtWidgets.QPushButton('Enable Custom Theme')
-        run_row.addWidget(self.run_btn)
-        run_row.addWidget(self.cancel_btn)
-        run_row.addWidget(self.theme_btn)
-        self.progress = QtWidgets.QProgressBar(); self.progress.setValue(0)
+        self.theme_btn = QtWidgets.QPushButton('Toggle Theme')
+        run_row.addWidget(self.run_btn, 3)
+        run_row.addWidget(self.cancel_btn, 1)
+        run_row.addWidget(self.theme_btn, 1)
+        self.progress = QtWidgets.QProgressBar(); self.progress.setValue(0); self.progress.setTextVisible(True)
         layout.addLayout(run_row)
         layout.addWidget(self.progress)
 
         # Log area
+        log_label = QtWidgets.QLabel('Processing Log:')
+        layout.addWidget(log_label)
         self.log_edit = QtWidgets.QPlainTextEdit(); self.log_edit.setReadOnly(True)
+        self.log_edit.setMinimumHeight(150)
         layout.addWidget(self.log_edit, stretch=1)
 
         # Footer / status
-        self.status_label = QtWidgets.QLabel('Idle')
+        self.status_label = QtWidgets.QLabel('Ready')
+        self.status_label.setStyleSheet('font-weight: bold;')
         layout.addWidget(self.status_label)
 
         # Button connections
@@ -308,10 +393,15 @@ class MainWindow(QtWidgets.QWidget):
                 return None
             if not output_root.exists():
                 output_root.mkdir(parents=True, exist_ok=True)
-            scenes = [i.text() for i in self.scene_list.selectedItems()]
-            if not scenes:
-                QtWidgets.QMessageBox.warning(self, 'Error', 'Select at least one scene')
-                return None
+
+            flat_mode = self.mode_flat_radio.isChecked()
+            scenes = []
+            if not flat_mode:
+                scenes = [i.text() for i in self.scene_list.selectedItems()]
+                if not scenes:
+                    QtWidgets.QMessageBox.warning(self, 'Error', 'Select at least one scene')
+                    return None
+
             pad_rel_fraction = self.pad_rel_spin.value() / 100.0
             bayer_val = self.bayer_combo.currentText()
             if bayer_val == 'Auto/None':
@@ -320,6 +410,7 @@ class MainWindow(QtWidgets.QWidget):
                 input_root=input_root,
                 output_root=output_root,
                 scenes=scenes,
+                flat_mode=flat_mode,
                 method=self.method_combo.currentText(),
                 percentile=self.percentile_spin.value(),
                 pad=self.pad_spin.value(),
@@ -393,9 +484,20 @@ class MainWindow(QtWidgets.QWidget):
         out_name = f'processed_{ts}'
         self.output_edit.setText(str(base / out_name))
 
+    def _toggle_mode(self):
+        """Switch between scene-based and flat image directory mode."""
+        scene_mode = self.mode_scene_radio.isChecked()
+        self.scene_group.setVisible(scene_mode)
+        if not scene_mode:
+            # Flat mode: clear scene list and prepare for root-level image detection
+            self.scene_list.clear()
+            self.log_edit.appendPlainText('Switched to flat mode: will process all images in root directory')
+        else:
+            self.log_edit.appendPlainText('Switched to scene mode: organize images by subfolder')
+
     def _toggle_advanced(self):
         hide = self.adv_toggle.isChecked()
-        self.adv_toggle.setText('Show Advanced' if hide else 'Hide Advanced')
+        self.adv_toggle.setText('▲ Hide Advanced Options' if hide else '▼ Show Advanced Options')
         for w in self._advanced_widgets:
             w_parent = w.parentWidget()
             if w_parent:
@@ -536,7 +638,7 @@ class MainWindow(QtWidgets.QWidget):
 
     def _toggle_theme(self):
         self._use_custom_style = not self._use_custom_style
-        self.theme_btn.setText('Disable Custom Theme' if self._use_custom_style else 'Enable Custom Theme')
+        self.theme_btn.setText('System Theme' if self._use_custom_style else 'Custom Theme')
         self._apply_style()
 
 
