@@ -87,8 +87,6 @@ class Worker(QtCore.QObject):
                     patterns_raw=self.settings.patterns_raw,
                     recursive=self.settings.recursive,
                 )
-                if self.settings.max_images > 0:
-                    img_paths = img_paths[:self.settings.max_images]
                 total = len(img_paths)
                 self.emitter.message.emit(f"Found {total} images in root directory")
 
@@ -128,8 +126,6 @@ class Worker(QtCore.QObject):
                         patterns_raw=self.settings.patterns_raw,
                         recursive=self.settings.recursive,
                     )
-                    if self.settings.max_images > 0:
-                        imgs = imgs[:self.settings.max_images]
                     scene_img_map[s] = imgs
                     all_img_paths.extend(imgs)
                     total += len(imgs)
@@ -408,10 +404,6 @@ class MainWindow(QtWidgets.QWidget):
         self.patterns_edit.setPlaceholderText('e.g. *.png;*.jpg (empty = all images)')
         self.patterns_edit.setToolTip('Filter files by pattern')
 
-        self.max_images_spin = QtWidgets.QSpinBox()
-        self.max_images_spin.setRange(0, 100000)
-        self.max_images_spin.setValue(0)
-        self.max_images_spin.setToolTip('Limit processing (0 = all images)')
 
         # Add main options
         add_row('Preset', self.preset_combo)
@@ -434,7 +426,6 @@ class MainWindow(QtWidgets.QWidget):
         add_row('Save RGBA', self.save_rgba_cb)
         add_row('Save Cropped RGB', self.save_crop_cb)
         add_row('Debug Visualization', self.debug_cb)
-        add_row('Limit Images', self.max_images_spin)
 
         # Advanced section toggle button
         self.adv_toggle = QtWidgets.QPushButton('▼ Show Advanced Options')
@@ -756,7 +747,7 @@ class MainWindow(QtWidgets.QWidget):
                 patterns_raw=self.patterns_edit.text().strip(),
                 recursive=self.recursive_cb.isChecked(),
                 bayer_pattern=bayer_val,
-                max_images=self.max_images_spin.value(),
+                max_images=0,
             )
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, 'Error', f'Failed collect settings: {e}')
@@ -771,6 +762,10 @@ class MainWindow(QtWidgets.QWidget):
         self.status_label.setText('Running...')
         self.run_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
+
+        # Disable all settings during processing
+        self._set_settings_enabled(False)
+
         self.worker = Worker(settings, self.emitter)
         self.worker_thread = threading.Thread(target=self.worker.run, daemon=True)
         self.worker_thread.start()
@@ -800,7 +795,41 @@ class MainWindow(QtWidgets.QWidget):
         self.status_label.setText(msg)
         self.log_edit.appendPlainText(f"Finished: {msg}")
 
+        # Re-enable all settings after processing
+        self._set_settings_enabled(True)
+
     # --- Helpers --- #
+    def _set_settings_enabled(self, enabled: bool):
+        """Enable or disable all settings widgets during processing."""
+        # Input controls
+        self.input_edit.setEnabled(enabled)
+        self.preview_btn.setEnabled(enabled)
+        self.select_all_btn.setEnabled(enabled)
+        self.scene_list.setEnabled(enabled)
+
+        # Processing options
+        self.preset_combo.setEnabled(enabled)
+        self.ai_seg_cb.setEnabled(enabled)
+        self.pad_mode_absolute.setEnabled(enabled)
+        self.pad_mode_relative.setEnabled(enabled)
+        self.pad_spin.setEnabled(enabled and self.pad_mode_absolute.isChecked())
+        self.pad_rel_spin.setEnabled(enabled and self.pad_mode_relative.isChecked())
+        self.union_cb.setEnabled(enabled)
+        self.square_cb.setEnabled(enabled)
+        self.save_mask_cb.setEnabled(enabled)
+        self.save_rgba_cb.setEnabled(enabled)
+        self.save_crop_cb.setEnabled(enabled)
+        self.debug_cb.setEnabled(enabled)
+
+        # Advanced options
+        self.rgba_opaque_cb.setEnabled(enabled)
+        self.bbox_only_cb.setEnabled(enabled)
+        self.method_combo.setEnabled(enabled)
+        self.percentile_spin.setEnabled(enabled)
+        self.bayer_combo.setEnabled(enabled)
+        self.recursive_cb.setEnabled(enabled)
+        self.patterns_edit.setEnabled(enabled)
+
     def _auto_output_dir(self):
         root = self.input_edit.text().strip()
         if not root:
